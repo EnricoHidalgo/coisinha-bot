@@ -1,7 +1,6 @@
 const { SlashCommandBuilder, EmbedBuilder } = require('@discordjs/builders');
-const { joinVoiceChannel, createAudioPlayer, createAudioResource, entersState, AudioPlayerStatus, VoiceConnectionStatus } = require('@discordjs/voice');
-const ytdl = require('ytdl-core');
-const yts = require('yt-search');
+const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus } = require('@discordjs/voice');
+const play = require('play-dl');
 
 // Fila de músicas por servidor
 const queues = new Map();
@@ -70,7 +69,7 @@ module.exports = {
     
     switch(subcommand) {
       case 'tocar':
-        await playMusic(interaction);
+        await playMusicSlash(interaction);
         break;
       case 'pular':
         await skipMusic(interaction);
@@ -94,7 +93,7 @@ module.exports = {
   }
 };
 
-// Comandos com prefixo !!
+// ==================== COMANDOS COM PREFIXO !! ====================
 module.exports.prefixCommands = {
   'musica tocar': async (message, args) => {
     if (!message.member.voice.channel) {
@@ -115,7 +114,8 @@ module.exports.prefixCommands = {
         connection: null,
         player: null,
         volume: 5,
-        textChannel: message.channel
+        textChannel: message.channel,
+        isPlaying: false
       });
     }
     
@@ -123,25 +123,40 @@ module.exports.prefixCommands = {
     queue.textChannel = message.channel;
     
     try {
-      let songInfo;
+      const msg = await message.reply('🔍 Procurando música...');
       
-      // Verificar se é URL do YouTube
-      if (ytdl.validateURL(query)) {
-        songInfo = await ytdl.getInfo(query);
-      } else {
-        // Buscar por nome
-        const searchResult = await yts(query);
-        if (searchResult.videos.length === 0) {
-          return message.reply('❌ Nenhum resultado encontrado!');
-        }
-        songInfo = await ytdl.getInfo(searchResult.videos[0].url);
+      let songInfo;
+      let isUrl = false;
+      
+      // Verificar se é URL
+      try {
+        const urlType = play.yt_validate(query);
+        isUrl = urlType === 'video' || urlType === 'playlist';
+      } catch (error) {
+        isUrl = false;
       }
       
+      if (isUrl) {
+        // É URL
+        songInfo = await play.video_info(query);
+      } else {
+        // É busca por texto
+        const searchResults = await play.search(query, { limit: 1 });
+        if (searchResults.length === 0) {
+          await msg.edit('❌ Nenhum resultado encontrado!');
+          return;
+        }
+        songInfo = await play.video_info(searchResults[0].url);
+      }
+      
+      const videoDetails = songInfo.video_details;
       const song = {
-        title: songInfo.videoDetails.title,
-        url: songInfo.videoDetails.video_url,
-        duration: parseInt(songInfo.videoDetails.lengthSeconds),
-        requestedBy: message.author.id
+        title: videoDetails.title,
+        url: videoDetails.url,
+        duration: videoDetails.durationInSec,
+        thumbnail: videoDetails.thumbnails[0]?.url,
+        requestedBy: message.author.id,
+        channel: videoDetails.channel?.name || 'Desconhecido'
       };
       
       queue.songs.push(song);
@@ -165,12 +180,14 @@ module.exports.prefixCommands = {
           if (queue.songs.length > 0) {
             playSong(guildId, queue.songs[0]);
           } else {
+            queue.isPlaying = false;
+            // Desconectar após 5 minutos de inatividade
             setTimeout(() => {
-              if (queue.player && queue.player.state.status === AudioPlayerStatus.Idle) {
+              if (!queue.isPlaying && queue.connection) {
                 queue.connection.destroy();
                 queues.delete(guildId);
               }
-            }, 30000);
+            }, 5 * 60 * 1000); // 5 minutos
           }
         });
         
@@ -189,22 +206,25 @@ module.exports.prefixCommands = {
       const embed = new EmbedBuilder()
         .setColor(0x00FF00)
         .setTitle('✅ Adicionada à fila')
-        .setDescription(`**${song.title}**`)
+        .setDescription(`[${song.title}](${song.url})`)
         .addFields(
-          { name: '⏰ Duração', value: `${Math.floor(song.duration / 60)}:${(song.duration % 60).toString().padStart(2, '0')}`, inline: true },
+          { name: '⏰ Duração', value: formatDuration(song.duration), inline: true },
+          { name: '🎙️ Canal', value: song.channel, inline: true },
           { name: '👤 Solicitado por', value: `<@${song.requestedBy}>`, inline: true },
-          { name: '📊 Posição na fila', value: `${queue.songs.length}`, inline: true }
-        );
+          { name: '📊 Posição', value: `#${queue.songs.length}`, inline: true }
+        )
+        .setThumbnail(song.thumbnail)
+        .setFooter({ text: 'Use !!musica fila para ver todas as músicas' });
       
-      await message.reply({ embeds: [embed] });
+      await msg.edit({ content: null, embeds: [embed] });
       
       // Tocar música se for a primeira
       if (queue.songs.length === 1) {
-        playSong(guildId, song);
+        await playSong(guildId, song);
       }
     } catch (error) {
-      console.error(error);
-      await message.reply('❌ Erro ao tocar música!');
+      console.error('Erro no comando de música:', error);
+      await message.reply('❌ Erro ao tocar música! Tente novamente ou use outro comando.');
     }
   },
   
@@ -233,7 +253,7 @@ module.exports.prefixCommands = {
     }
     
     const songsList = queue.songs.slice(0, 10).map((song, index) => 
-      `**${index + 1}.** ${song.title} (${Math.floor(song.duration / 60)}:${(song.duration % 60).toString().padStart(2, '0')})`
+      `**${index + 1}.** [${song.title.substring(0, 50)}](${song.url}) (${formatDuration(song.duration)})`
     ).join('\n');
     
     const embed = new EmbedBuilder()
@@ -242,8 +262,12 @@ module.exports.prefixCommands = {
       .setDescription(songsList)
       .addFields({
         name: '📊 Informações',
-        value: `Total: ${queue.songs.length} música(s)\nVolume: ${queue.volume}/10\nAtual: ${queue.songs[0].title.substring(0, 50)}...`
+        value: `**Total:** ${queue.songs.length} música(s)\n**Volume:** ${queue.volume}/10\n**Tocando agora:** ${queue.songs[0]?.title?.substring(0, 50) || 'Nenhuma'}`
       });
+    
+    if (queue.songs[0]?.thumbnail) {
+      embed.setThumbnail(queue.songs[0].thumbnail);
+    }
     
     await message.reply({ embeds: [embed] });
   },
@@ -261,7 +285,9 @@ module.exports.prefixCommands = {
     }
     
     queue.songs = [];
-    queue.player.stop();
+    if (queue.player) {
+      queue.player.stop();
+    }
     
     if (queue.connection) {
       queue.connection.destroy();
@@ -338,21 +364,23 @@ module.exports.prefixCommands = {
   }
 };
 
-// Funções auxiliares
-function playSong(guildId, song) {
+// ==================== FUNÇÕES AUXILIARES ====================
+async function playSong(guildId, song) {
   const queue = queues.get(guildId);
   
   if (!song) return;
   
   try {
-    const stream = ytdl(song.url, { 
-      filter: 'audioonly',
-      quality: 'highestaudio',
-      highWaterMark: 1 << 25 
+    queue.isPlaying = true;
+    
+    // Usar play-dl para streaming
+    const stream = await play.stream(song.url, {
+      quality: 2, // 0 = lowest, 2 = highest audio
+      discordPlayerCompatibility: true
     });
     
-    const resource = createAudioResource(stream, {
-      inputType: StreamType.Arbitrary,
+    const resource = createAudioResource(stream.stream, {
+      inputType: stream.type,
       inlineVolume: true
     });
     
@@ -364,11 +392,14 @@ function playSong(guildId, song) {
       const embed = new EmbedBuilder()
         .setColor(0x00FF00)
         .setTitle('🎵 Tocando Agora')
-        .setDescription(`**${song.title}**`)
+        .setDescription(`[${song.title}](${song.url})`)
         .addFields(
-          { name: '⏰ Duração', value: `${Math.floor(song.duration / 60)}:${(song.duration % 60).toString().padStart(2, '0')}`, inline: true },
+          { name: '⏰ Duração', value: formatDuration(song.duration), inline: true },
+          { name: '🎙️ Canal', value: song.channel, inline: true },
           { name: '👤 Solicitado por', value: `<@${song.requestedBy}>`, inline: true }
-        );
+        )
+        .setThumbnail(song.thumbnail)
+        .setFooter({ text: 'Use !!musica pular para pular esta música' });
       
       queue.textChannel.send({ embeds: [embed] }).catch(() => {});
     }
@@ -384,8 +415,14 @@ function playSong(guildId, song) {
   }
 }
 
-// Funções para slash commands
-async function playMusic(interaction) {
+function formatDuration(seconds) {
+  const minutes = Math.floor(seconds / 60);
+  const secs = seconds % 60;
+  return `${minutes}:${secs.toString().padStart(2, '0')}`;
+}
+
+// ==================== FUNÇÕES PARA SLASH COMMANDS ====================
+async function playMusicSlash(interaction) {
   if (!interaction.member.voice.channel) {
     return interaction.reply({ content: '❌ Entre em um canal de voz primeiro!', ephemeral: true });
   }
@@ -399,7 +436,8 @@ async function playMusic(interaction) {
       connection: null,
       player: null,
       volume: 5,
-      textChannel: interaction.channel
+      textChannel: interaction.channel,
+      isPlaying: false
     });
   }
   
@@ -410,22 +448,34 @@ async function playMusic(interaction) {
     await interaction.deferReply();
     
     let songInfo;
+    let isUrl = false;
     
-    if (ytdl.validateURL(query)) {
-      songInfo = await ytdl.getInfo(query);
-    } else {
-      const searchResult = await yts(query);
-      if (searchResult.videos.length === 0) {
-        return interaction.editReply('❌ Nenhum resultado encontrado!');
-      }
-      songInfo = await ytdl.getInfo(searchResult.videos[0].url);
+    // Verificar se é URL
+    try {
+      const urlType = play.yt_validate(query);
+      isUrl = urlType === 'video' || urlType === 'playlist';
+    } catch (error) {
+      isUrl = false;
     }
     
+    if (isUrl) {
+      songInfo = await play.video_info(query);
+    } else {
+      const searchResults = await play.search(query, { limit: 1 });
+      if (searchResults.length === 0) {
+        return interaction.editReply('❌ Nenhum resultado encontrado!');
+      }
+      songInfo = await play.video_info(searchResults[0].url);
+    }
+    
+    const videoDetails = songInfo.video_details;
     const song = {
-      title: songInfo.videoDetails.title,
-      url: songInfo.videoDetails.video_url,
-      duration: parseInt(songInfo.videoDetails.lengthSeconds),
-      requestedBy: interaction.user.id
+      title: videoDetails.title,
+      url: videoDetails.url,
+      duration: videoDetails.durationInSec,
+      thumbnail: videoDetails.thumbnails[0]?.url,
+      requestedBy: interaction.user.id,
+      channel: videoDetails.channel?.name || 'Desconhecido'
     };
     
     queue.songs.push(song);
@@ -447,12 +497,13 @@ async function playMusic(interaction) {
         if (queue.songs.length > 0) {
           playSong(guildId, queue.songs[0]);
         } else {
+          queue.isPlaying = false;
           setTimeout(() => {
-            if (queue.player && queue.player.state.status === AudioPlayerStatus.Idle) {
+            if (!queue.isPlaying && queue.connection) {
               queue.connection.destroy();
               queues.delete(guildId);
             }
-          }, 30000);
+          }, 5 * 60 * 1000);
         }
       });
     }
@@ -460,21 +511,24 @@ async function playMusic(interaction) {
     const embed = new EmbedBuilder()
       .setColor(0x00FF00)
       .setTitle('✅ Adicionada à fila')
-      .setDescription(`**${song.title}**`)
+      .setDescription(`[${song.title}](${song.url})`)
       .addFields(
-        { name: '⏰ Duração', value: `${Math.floor(song.duration / 60)}:${(song.duration % 60).toString().padStart(2, '0')}`, inline: true },
+        { name: '⏰ Duração', value: formatDuration(song.duration), inline: true },
+        { name: '🎙️ Canal', value: song.channel, inline: true },
         { name: '👤 Solicitado por', value: `<@${song.requestedBy}>`, inline: true },
-        { name: '📊 Posição na fila', value: `${queue.songs.length}`, inline: true }
-      );
+        { name: '📊 Posição', value: `#${queue.songs.length}`, inline: true }
+      )
+      .setThumbnail(song.thumbnail)
+      .setFooter({ text: 'Use /musica fila para ver todas as músicas' });
     
     await interaction.editReply({ embeds: [embed] });
     
     if (queue.songs.length === 1) {
-      playSong(guildId, song);
+      await playSong(guildId, song);
     }
   } catch (error) {
-    console.error(error);
-    await interaction.editReply('❌ Erro ao tocar música!');
+    console.error('Erro no comando de música:', error);
+    await interaction.editReply('❌ Erro ao tocar música! Tente novamente.');
   }
 }
 
@@ -499,7 +553,7 @@ async function showQueue(interaction) {
   }
   
   const songsList = queue.songs.slice(0, 10).map((song, index) => 
-    `**${index + 1}.** ${song.title} (${Math.floor(song.duration / 60)}:${(song.duration % 60).toString().padStart(2, '0')})`
+    `**${index + 1}.** [${song.title.substring(0, 50)}](${song.url}) (${formatDuration(song.duration)})`
   ).join('\n');
   
   const embed = new EmbedBuilder()
@@ -508,8 +562,12 @@ async function showQueue(interaction) {
     .setDescription(songsList)
     .addFields({
       name: '📊 Informações',
-      value: `Total: ${queue.songs.length} música(s)\nVolume: ${queue.volume}/10`
+      value: `**Total:** ${queue.songs.length} música(s)\n**Volume:** ${queue.volume}/10`
     });
+  
+  if (queue.songs[0]?.thumbnail) {
+    embed.setThumbnail(queue.songs[0].thumbnail);
+  }
   
   await interaction.reply({ embeds: [embed] });
 }
@@ -523,7 +581,9 @@ async function stopMusic(interaction) {
   }
   
   queue.songs = [];
-  queue.player.stop();
+  if (queue.player) {
+    queue.player.stop();
+  }
   
   if (queue.connection) {
     queue.connection.destroy();
