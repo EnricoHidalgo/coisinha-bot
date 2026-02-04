@@ -1,5 +1,5 @@
 const { SlashCommandBuilder, EmbedBuilder } = require('discord.js');
-const User = require('../models/User');
+const { User } = require('../models');
 const mongoose = require('mongoose');
 
 module.exports = {
